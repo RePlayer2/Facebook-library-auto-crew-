@@ -58,6 +58,15 @@ cd /Users/zzh/C/similar_craw
 source /Users/zzh/C/similar_craw/crawler/.venv/bin/activate
 ```
 
+安装 Python 依赖：
+
+```bash
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+如果需要使用剪映导入功能，还需要本机可用 `ffmpeg` / `ffprobe`，并先启动 [capcut-mate](https://github.com/Hommy-master/capcut-mate) 后端。
+
 ## 一键流程：按资料库编号抓取
 
 ```bash
