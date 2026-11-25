@@ -211,3 +211,13 @@ python3 scripts/meta_material_pipeline.py capcut \
 - 如果抓取需要登录态，请使用原脚本支持的 `--storage-state` 参数。
 - 如果页面只有 1 条广告，建议使用 `--scroll-rounds 5 --stop-after-stable-rounds 3 --wait-ms 2000`，避免滚动等待太久。
 - 剪映导入依赖本地 [capcut-mate](https://github.com/Hommy-master/capcut-mate) 服务，需要先启动后端。
+# 当前桌面客户端备份（2026-11-25）
+
+最新桌面源码及其后端快照位于 [`desktop-client/`](desktop-client/)，旧 CLI 内容继续保留。
+本次发布 `v2026.11.25`，Release 附件分别提供 Apple Silicon 与 Intel 的完整 macOS 应用；二进制沿用 2026-11-05 的并发抓取版本。
+请按处理器选择，不要将 ARM 安装包发送给 Intel 电脑。
+
+新增能力：默认 2、最高 5 路并发；完成屏障后再整理；仅失败编号重试并补回原位置；内置后端启停；跨电脑浏览器路径及 CA 证书修复。
+
+验证与限制详见 [`RELEASE_NOTES_2026.11.25.md`](RELEASE_NOTES_2026.11.25.md)。本仓库不含本地广告素材、用户配置或密钥。
+

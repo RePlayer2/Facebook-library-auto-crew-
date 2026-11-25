@@ -1,0 +1,136 @@
+from src.utils.logger import logger
+import json
+from typing import List, Optional, Dict, Any
+
+
+def caption_infos(
+    texts: List[str],
+    timelines: List[Dict[str, int]],
+    font_size: Optional[int] = None,
+    keyword_color: Optional[str] = None,
+    keyword_border_color: Optional[str] = None,
+    keyword_font_size: Optional[int] = None,
+    keywords: Optional[List[str]] = None,
+    in_animation: Optional[str] = None,
+    in_animation_duration: Optional[int] = None,
+    loop_animation: Optional[str] = None,
+    loop_animation_duration: Optional[int] = None,
+    out_animation: Optional[str] = None,
+    out_animation_duration: Optional[int] = None,
+    transition: Optional[str] = None,
+    transition_duration: Optional[int] = None
+) -> str:
+    """
+    根据文本和时间线生成字幕信息JSON字符串
+    
+    Args:
+        texts: 文本列表
+        timelines: 时间线数组
+        font_size: 字体大小（可选）
+        keyword_color: 关键词颜色（可选）
+        keyword_border_color: 关键词边框颜色（可选）
+        keyword_font_size: 关键词字体大小（可选）
+        keywords: 文本里面的重点词列表（可选）
+        in_animation: 入场动画名称（可选）
+        in_animation_duration: 入场动画时长（可选）
+        loop_animation: 组合动画名称（可选）
+        loop_animation_duration: 循环动画单次循环时长，微秒（可选）
+        out_animation: 出场动画名称（可选）
+        out_animation_duration: 出场动画时长（可选）
+        transition: 转场名称（可选）
+        transition_duration: 转场时长（可选）
+        
+    Returns:
+        str: JSON字符串格式的字幕信息
+        
+    Raises:
+        无异常抛出，长度不匹配时以最短的为准
+    """
+    logger.info(f"caption_infos called with {len(texts)} texts and {len(timelines)} timelines")
+    
+    # 长度不相等时以最短的为准
+    if len(texts) != len(timelines):
+        min_len = min(len(texts), len(timelines))
+        logger.warning(f"texts length ({len(texts)}) does not match timelines length ({len(timelines)}), using shorter length: {min_len}")
+        texts = texts[:min_len]
+        timelines = timelines[:min_len]
+    
+    # 构建字幕信息列表
+    infos = []
+    for i, (text, timeline) in enumerate(zip(texts, timelines)):
+        info = _build_caption_info(text, timeline, i, keywords, 
+                                font_size, keyword_color, keyword_border_color, keyword_font_size,
+                                in_animation, in_animation_duration,
+                                loop_animation, loop_animation_duration,
+                                out_animation, out_animation_duration,
+                                transition, transition_duration)
+        infos.append(info)
+        logger.info(f"Processed caption info {i+1}: {info}")
+    
+    # 转换为JSON字符串
+    infos_json = json.dumps(infos, ensure_ascii=False)
+    logger.info(f"Generated caption infos JSON with {len(infos)} items")
+    
+    return infos_json
+
+
+def _build_caption_info(text, timeline, index, keywords,
+                       font_size, keyword_color, keyword_border_color, keyword_font_size,
+                       in_animation, in_animation_duration,
+                       loop_animation, loop_animation_duration,
+                       out_animation, out_animation_duration,
+                       transition, transition_duration):
+    """构建单个字幕信息字典"""
+    info = {
+        "start": timeline["start"],
+        "end": timeline["end"],
+        "text": text
+    }
+    
+    # 添加关键词信息，如果keywords存在且有足够的关键词，则按索引分配
+    # 如果keywords数量少于文本数量，只有前几个文本有关键词，其余为空字符串
+    if keywords is not None and len(keywords) > 0:
+        if index < len(keywords):
+            info["keyword"] = keywords[index]
+        else:
+            info["keyword"] = ""  # 当关键词不够时，后续文本关键词设为空字符串
+    
+    # 添加可选参数
+    if keyword_color is not None:
+        info["keyword_color"] = keyword_color
+    
+    if keyword_border_color is not None:
+        info["keyword_border_color"] = keyword_border_color
+    
+    if keyword_font_size is not None:
+        info["keyword_font_size"] = keyword_font_size
+    
+    if font_size is not None:
+        info["font_size"] = font_size
+    
+    # 添加动画参数
+    if in_animation is not None:
+        info["in_animation"] = in_animation
+    
+    if in_animation_duration is not None:
+        info["in_animation_duration"] = in_animation_duration
+    
+    if loop_animation is not None:
+        info["loop_animation"] = loop_animation
+    
+    if loop_animation_duration is not None:
+        info["loop_animation_duration"] = loop_animation_duration
+    
+    if out_animation is not None:
+        info["out_animation"] = out_animation
+    
+    if out_animation_duration is not None:
+        info["out_animation_duration"] = out_animation_duration
+    
+    if transition is not None:
+        info["transition"] = transition
+    
+    if transition_duration is not None:
+        info["transition_duration"] = transition_duration
+    
+    return info

@@ -1,0 +1,625 @@
+# Copyright 2026 Hommy <taohongmin@sina.cn>.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from src.utils.logger import logger
+from src.pyJianYingDraft import ScriptFile, trange, AudioSceneEffectType, VideoSceneEffectType, VideoCharacterEffectType
+import src.pyJianYingDraft as draft
+from src.pyJianYingDraft.local_materials import AudioMaterial
+from src.utils.draft_cache import DRAFT_CACHE
+from exceptions import CustomException, CustomError
+import os
+from src.utils import helper
+from src.utils.download import download
+import config
+import json
+import asyncio
+import time
+from typing import List, Dict, Any, Tuple, Optional
+from src.utils.draft_lock_manager import DraftLockManager
+
+
+def add_audios(
+    draft_url: str, 
+    audio_infos: str
+) -> Tuple[str, str, List[str]]:
+    """
+    添加音频到剪映草稿的业务逻辑
+    
+    Args:
+        draft_url: 草稿URL，必选参数
+        audio_infos: 音频信息JSON字符串
+
+    Returns:
+        draft_url: 草稿URL
+        track_id: 音频轨道ID（非主轨道）
+        audio_ids: 音频ID列表
+
+    Raises:
+        CustomException: 音频批量添加失败
+    """
+    return _add_audios_internal(draft_url, audio_infos, prepared_audios=None)
+
+
+def _prepare_audios_local_files(draft_url: str, audio_infos: str) -> List[Dict[str, Any]]:
+    """
+    校验草稿、解析 audio_infos 并下载素材到草稿目录。
+    不修改 ScriptFile，可在草稿写锁外调用。
+    """
+    draft_id = validate_and_get_draft_id(draft_url)
+    draft_audio_dir = create_audio_directory(draft_id)
+    audios = parse_audio_data(json_str=audio_infos)
+    validate_audio_data(audios, draft_id)
+    for audio in audios:
+        audio["local_audio_path"] = download_audio_file(audio, draft_audio_dir)
+    return audios
+
+
+def _add_audios_internal(
+    draft_url: str,
+    audio_infos: str,
+    prepared_audios: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, str, List[str]]:
+    logger.info(f"add_audios, draft_url: {draft_url}, audio_infos: {audio_infos}")
+
+    draft_id = validate_and_get_draft_id(draft_url)
+    script: ScriptFile = DRAFT_CACHE[draft_id]
+
+    draft_audio_dir = create_audio_directory(draft_id)
+
+    if prepared_audios is not None:
+        audios = prepared_audios
+    else:
+        audios = parse_audio_data(json_str=audio_infos)
+        validate_audio_data(audios, draft_id)
+
+    track_name = add_audio_track(script)
+
+    audio_ids = add_audio_segments(script, track_name, draft_audio_dir, audios)
+
+    script.save()
+    logger.info(f"Draft saved successfully")
+
+    track_id = get_track_id(script, track_name)
+    logger.info(f"Audio track created, draft_id: {draft_id}, track_id: {track_id}")
+
+    return draft_url, track_id, audio_ids
+
+
+async def add_audios_async(
+    draft_url: str,
+    audio_infos: str,
+    lock_timeout: float = 30.0
+) -> Tuple[str, str, List[str]]:
+    """
+    添加音频到剪映草稿的异步版本（带并发锁保护）
+    
+    功能：
+    1. 使用 DraftLockManager 防止同一草稿的并发写操作
+    2. 支持超时控制，避免无限等待
+    3. 自动释放锁，即使发生异常
+    4. 音频下载在获取锁之前完成，持锁阶段仅修改草稿与写盘
+    
+    Args:
+        draft_url: 草稿 URL，格式：".../get_draft?draft_id=xxx"
+        audio_infos: JSON 字符串，包含音频信息列表，详见 add_audios 函数
+        lock_timeout: 获取锁的超时时间（秒），默认 30 秒
+    
+    Returns:
+        tuple: (draft_url, track_id, audio_ids)
+    
+    Raises:
+        CustomException: 音频添加失败，或 `DRAFT_LOCK_TIMEOUT`（获取写锁超时）
+    
+    Example:
+        >>> result = await add_audios_async(
+        ...     draft_url="http://.../draft_id=123",
+        ...     audio_infos='[{"audio_url":"...", "start":0, "end":5000000}]'
+        ... )
+    """
+    draft_id = helper.get_url_param(draft_url, "draft_id")
+    if not draft_id:
+        raise CustomException(CustomError.INVALID_DRAFT_URL)
+
+    logger.info(f"[flow:add_audios] prep_start, draft_id: {draft_id}")
+    # 下载与预处理放到线程池，避免阻塞事件循环导致锁超时漂移
+    prep_started_at = time.monotonic()
+    prepared_audios = await asyncio.to_thread(
+        _prepare_audios_local_files,
+        draft_url,
+        audio_infos,
+    )
+    logger.info(
+        f"[flow:add_audios] prep_done, draft_id: {draft_id}, "
+        f"count: {len(prepared_audios)}, elapsed: {time.monotonic() - prep_started_at:.3f}s"
+    )
+
+    lock_manager = DraftLockManager()
+
+    logger.info(f"[flow:add_audios] lock_wait_start, draft_id: {draft_id}, timeout: {lock_timeout}s")
+    try:
+        await lock_manager.acquire_lock(draft_id, timeout=lock_timeout)
+        logger.info(f"[flow:add_audios] lock_acquired, draft_id: {draft_id}")
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout waiting for lock on draft_id: {draft_id}")
+        raise CustomException(
+            CustomError.DRAFT_LOCK_TIMEOUT,
+            f"Failed to acquire lock for draft {draft_id} within {lock_timeout}s",
+        )
+
+    try:
+        return _add_audios_internal(
+            draft_url=draft_url,
+            audio_infos=audio_infos,
+            prepared_audios=prepared_audios,
+        )
+    finally:
+        await lock_manager.release_lock(draft_id)
+        logger.info(f"[flow:add_audios] lock_released, draft_id: {draft_id}")
+
+
+def validate_and_get_draft_id(draft_url: str) -> str:
+    """验证草稿URL并提取草稿ID"""
+    draft_id = helper.get_url_param(draft_url, "draft_id")
+    if (not draft_id) or (draft_id not in DRAFT_CACHE):
+        logger.error(f"Invalid draft URL or draft not found in cache, draft_id: {draft_id}")
+        raise CustomException(CustomError.INVALID_DRAFT_URL)
+    return draft_id
+
+
+def create_audio_directory(draft_id: str) -> str:
+    """创建音频资源存储目录"""
+    draft_dir = os.path.join(config.DRAFT_DIR, draft_id)
+    draft_audio_dir = os.path.join(draft_dir, "assets", "audios")
+    os.makedirs(name=draft_audio_dir, exist_ok=True)
+    logger.info(f"Created audio directory: {draft_audio_dir}")
+    return draft_audio_dir
+
+
+def validate_audio_data(audios: List[Dict[str, Any]], draft_id: str):
+    """验证音频数据是否为空"""
+    if len(audios) == 0:
+        logger.error(f"No audio info provided, draft_id: {draft_id}")
+        raise CustomException(CustomError.INVALID_AUDIO_INFO)
+    logger.info(f"Parsed {len(audios)} audio items")
+
+
+def add_audio_track(script: ScriptFile) -> str:
+    """添加音频轨道到草稿"""
+    track_name = f"audio_track_{helper.gen_unique_id()}"
+    # 设置 relative_index=10 确保音频轨道在主音频轨道之上，避免与主轨道冲突
+    script.add_track(track_type=draft.TrackType.audio, track_name=track_name, relative_index=10)
+    logger.info(f"Added audio track (non-main track): {track_name}")
+    return track_name
+
+
+def add_audio_segments(script: ScriptFile, track_name: str, draft_audio_dir: str, audios: List[Dict[str, Any]]) -> List[str]:
+    """批量添加音频片段到指定轨道"""
+    audio_ids = []
+    for i, audio in enumerate(audios):
+        try:
+            audio_id = add_audio_to_draft(script, track_name, draft_audio_dir=draft_audio_dir, audio=audio)
+            audio_ids.append(audio_id)
+            logger.info(f"Added audio {i+1}/{len(audios)}, audio_id: {audio_id}")
+        except Exception as e:
+            logger.error(f"Failed to add audio {i+1}/{len(audios)}, error: {str(e)}")
+            raise
+    return audio_ids
+
+
+def get_track_id(script: ScriptFile, track_name: str) -> str:
+    """根据轨道名称获取轨道ID"""
+    track_id = ""
+    for key in script.tracks.keys():
+        if script.tracks[key].name == track_name:
+            track_id = script.tracks[key].track_id
+            break
+    return track_id
+
+
+def find_audio_effect_type(audio_effect: str):
+    """
+    根据音频效果名称查找对应的效果类型
+    
+    Args:
+        audio_effect: 音频效果名称
+    
+    Returns:
+        effect_type: 对应的效果类型对象，如果未找到则返回None
+    """
+    effect_type = None
+    
+    # 查找对应的音频效果类型
+    for effect_name, effect_meta in AudioSceneEffectType.__members__.items():
+        if effect_meta.value.name == audio_effect:
+            effect_type = effect_meta
+            break
+    
+    # 如果没找到，则尝试在VideoSceneEffectType中查找
+    if effect_type is None:
+        for effect_name, effect_meta in VideoSceneEffectType.__members__.items():
+            if effect_meta.value.name == audio_effect:
+                effect_type = effect_meta
+                break
+    
+    # 如果没找到，则尝试在VideoCharacterEffectType中查找
+    if effect_type is None:
+        for effect_name, effect_meta in VideoCharacterEffectType.__members__.items():
+            if effect_meta.value.name == audio_effect:
+                effect_type = effect_meta
+                break
+    
+    return effect_type
+
+
+def convert_params_to_range(effect_type) -> list:
+    """
+    将效果参数转换为0-100范围内的值列表
+    
+    Args:
+        effect_type: 效果类型对象
+    
+    Returns:
+        params_list: 转换后的参数值列表
+    """
+    params_list = []
+    for param in effect_type.value.params:
+        # 将实际默认值转换为0-100范围内的值
+        if param.min_value != param.max_value:
+            # 计算参数值在0-100范围内的对应值
+            param_value = ((param.default_value - param.min_value) / (param.max_value - param.min_value)) * 100
+        else:
+            # 如果参数范围是固定值，则使用50作为默认值
+            param_value = 50
+        params_list.append(param_value)
+    
+    return params_list
+
+
+def add_audio_effect(audio_segment, audio_effect: str):
+    """
+    为音频片段添加音频效果
+    
+    Args:
+        audio_segment: 音频片段对象
+        audio_effect: 音频效果名称
+    """
+    effect_type = find_audio_effect_type(audio_effect)
+    
+    # 如果找到了对应的效果类型，则添加效果
+    if effect_type:
+        params_list = convert_params_to_range(effect_type)
+        
+        # 添加效果
+        audio_segment.add_effect(
+            effect_type=effect_type,
+            params=params_list
+        )
+        logger.info(f"Added audio effect: {audio_effect} with params: {params_list}")
+    else:
+        logger.warning(f"Unknown audio effect: {audio_effect}")
+
+
+def add_audio_to_draft(
+    script: ScriptFile,
+    track_name: str,
+    draft_audio_dir: str,
+    audio: dict
+) -> str:
+    """
+    向剪映草稿中添加单个音频
+    
+    Args:
+        script: 草稿文件对象
+        track_name: 音频轨道名称
+        draft_audio_dir: 音频资源目录
+        audio: 音频信息字典，包含以下字段：
+            audio_url: 音频URL
+            duration: 音频总时长(微秒)，可选字段
+            start: 开始时间(微秒)
+            end: 结束时间(微秒)
+            volume: 音量[0.0, 2.0]
+            audio_effect: 音频效果名称(可选)
+    
+    Returns:
+        material_id: 音频素材ID
+    
+    Raises:
+        CustomException: 添加音频失败
+    """
+    try:
+        audio_path = audio.get("local_audio_path")
+        if audio_path:
+            if not os.path.isfile(audio_path):
+                raise CustomException(
+                    CustomError.AUDIO_ADD_FAILED,
+                    f"Missing local file: {audio_path}",
+                )
+            logger.info(f"Using local audio: {audio_path}")
+        else:
+            audio_path = download_audio_file(audio, draft_audio_dir)
+        actual_duration = get_audio_actual_duration(audio_path)
+        
+        # 2. 处理音频时长参数
+        process_audio_duration(audio, actual_duration)
+        
+        # 3. 计算并调整音频片段时间范围
+        start_time, end_time, segment_duration = calculate_adjusted_time_range(audio, actual_duration)
+        
+        # 4. 更新音频对象中的时间参数
+        update_audio_time_params(audio, start_time, end_time)
+        
+        # 5. 创建音频片段
+        audio_segment = create_audio_segment(audio_path, start_time, segment_duration, audio)
+        
+        # 6. 添加音频效果（如果指定了）
+        if audio.get('audio_effect'):
+            add_audio_effect(audio_segment, audio['audio_effect'])
+        
+        logger.info(f"Created audio segment, material_id: {audio_segment.material_instance.material_id}")
+        logger.info(f"Audio segment details - start: {start_time}, duration: {segment_duration}, volume: {audio['volume']}")
+        
+        # 7. 添加片段到轨道（带重叠处理）
+        add_segment_with_overlap_handling(script, track_name, audio_segment, audio_path, start_time, segment_duration, audio)
+        
+        return audio_segment.material_instance.material_id
+        
+    except CustomException:
+        logger.error(f"Add audio to draft failed, draft_audio_dir: {draft_audio_dir}, audio: {audio}")
+        raise
+    except Exception as e:
+        logger.error(f"Add audio to draft failed, error: {str(e)}")
+        raise CustomException(err=CustomError.AUDIO_ADD_FAILED)
+
+
+def download_audio_file(audio: dict, draft_audio_dir: str) -> str:
+    """下载音频文件"""
+    audio_path = download(url=audio['audio_url'], save_dir=draft_audio_dir)
+    logger.info(f"Downloaded audio from {audio['audio_url']} to {audio_path}")
+    return audio_path
+
+
+def get_audio_actual_duration(audio_path: str) -> int:
+    """获取音频的实际时长"""
+    temp_material = AudioMaterial(audio_path)
+    actual_duration = temp_material.duration
+    logger.info(f"Actual audio duration: {actual_duration} microseconds")
+    return actual_duration
+
+
+def process_audio_duration(audio: dict, actual_duration: int):
+    """处理音频时长参数，如果没有提供duration，则使用实际检测到的时长"""
+    if audio.get('duration') is None:
+        audio['duration'] = actual_duration
+        logger.info(f"Using detected audio duration: {actual_duration} microseconds")
+
+
+def calculate_adjusted_time_range(audio: dict, actual_duration: int):
+    """计算并调整音频片段时间范围"""
+    start_time = audio['start']
+    requested_end_time = audio['end']
+    requested_duration = requested_end_time - start_time
+    
+    # 检查并修正开始时间，确保不小于0
+    if start_time < 0:
+        logger.warning(f"Start time {start_time} is negative, setting to 0")
+        start_time = 0
+        
+    # 根据实际音频时长和请求的时长进行智能处理
+    if actual_duration < requested_duration:
+        # 情况1: 音频实际长度不够（小于end - start）时，使用音频实际时长
+        logger.warning(f"Audio actual duration {actual_duration} is less than requested duration {requested_duration}, using actual duration")
+        # 使用音频实际时长，但保持起始时间不变
+        segment_duration = actual_duration
+        end_time = start_time + segment_duration
+    else:
+        # 情况2: 音频实际时长足够时，使用指定的end作为结束时间（但不超过音频实际时长）
+        calculated_end_time = min(requested_end_time, start_time + actual_duration)
+        segment_duration = calculated_end_time - start_time
+        end_time = calculated_end_time
+    
+    # 确保片段至少有最小持续时间，避免0持续时间导致的问题
+    if segment_duration <= 0:
+        logger.warning(f"Segment duration is zero or negative ({segment_duration}), setting to minimum duration")
+        # 设置最小持续时间，比如100微秒，这样可以避免重叠问题
+        segment_duration = 100
+        end_time = start_time + segment_duration
+    
+    logger.info(f"Adjusted audio segment: start={start_time}, end={end_time}, duration={segment_duration}, requested_duration={requested_duration}")
+    
+    return start_time, end_time, segment_duration
+
+
+def update_audio_time_params(audio: dict, start_time: int, end_time: int):
+    """更新音频对象中的时间参数"""
+    audio['start'] = start_time
+    audio['end'] = end_time
+
+
+def create_audio_segment(audio_path: str, start_time: int, segment_duration: int, audio: dict):
+    """创建音频片段对象"""
+    audio_segment = draft.AudioSegment(
+        material=audio_path,
+        target_timerange=trange(start=start_time, duration=segment_duration),
+        volume=audio['volume']
+    )
+    return audio_segment
+
+
+def add_segment_with_overlap_handling(script: ScriptFile, track_name: str, audio_segment, audio_path: str, start_time: int, segment_duration: int, audio: dict):
+    """添加片段到轨道，处理可能的重叠问题"""
+    try:
+        script.add_segment(audio_segment, track_name)
+    except Exception as e:
+        # 如果添加片段时出现重叠错误，尝试调整片段位置
+        if "overlaps" in str(e) or "overlap" in str(e).lower():
+            logger.warning(f"Segment overlap detected: {str(e)}, attempting to adjust")
+            # 稍微调整片段的开始时间，避免重叠
+            # 逐步增加偏移量，直到不再重叠
+            offset = 100
+            max_attempts = 10
+            attempts = 0
+            
+            while attempts < max_attempts:
+                try:
+                    adjusted_start = start_time + offset
+                    logger.info(f"Attempt {attempts + 1}: Adjusting segment start time from {start_time} to {adjusted_start}")
+                    
+                    # 重新创建片段，使用调整后的时间
+                    adjusted_audio_segment = draft.AudioSegment(
+                        material=audio_path,
+                        target_timerange=trange(start=adjusted_start, duration=segment_duration),
+                        volume=audio['volume']
+                    )
+                    
+                    # 再次尝试添加片段
+                    script.add_segment(adjusted_audio_segment, track_name)
+                    logger.info(f"Successfully added adjusted segment with start time {adjusted_start}")
+                    break  # 成功添加，跳出循环
+                except Exception as retry_e:
+                    if "overlaps" in str(retry_e) or "overlap" in str(retry_e).lower():
+                        attempts += 1
+                        offset += 100  # 增加偏移量
+                        logger.info(f"Still overlapping, increasing offset to {offset}")
+                    else:
+                        # 如果不是重叠错误，重新抛出异常
+                        raise
+            
+            if attempts >= max_attempts:
+                logger.error(f"Failed to add segment after {max_attempts} attempts, giving up")
+                raise
+        else:
+            # 如果不是重叠错误，重新抛出异常
+            raise
+
+
+def parse_audio_data(json_str: str) -> List[Dict[str, Any]]:
+    """
+    解析音频数据的JSON字符串，处理可选字段的默认值
+    
+    Args:
+        json_str: 包含音频数据的JSON字符串
+        
+    Returns:
+        包含音频对象的数组，每个对象都处理了默认值
+        
+    Raises:
+        CustomException: 当JSON格式错误或缺少必选字段时抛出
+    """
+    # 解析JSON字符串
+    data = parse_json_string(json_str)
+    
+    # 验证数据格式
+    validate_input_format(data)
+    
+    # 处理音频项列表
+    result = []
+    for i, item in enumerate(data):
+        processed_item = process_single_audio_item(item, i)
+        result.append(processed_item)
+    
+    return result
+
+
+def parse_json_string(json_str: str) -> List[Dict[str, Any]]:
+    """解析JSON字符串"""
+    try:
+        data = json.loads(json_str)
+        logger.info(f"Successfully parsed JSON with {len(data) if isinstance(data, list) else 1} items")
+        return data
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error: {e.msg}")
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"JSON parse error: {e.msg}")
+
+
+def validate_input_format(data: Any):
+    """验证输入数据格式"""
+    if not isinstance(data, list):
+        logger.error("Audio infos should be a list")
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, "audio_infos should be a list")
+
+
+def process_single_audio_item(item: Any, index: int) -> Dict[str, Any]:
+    """处理单个音频项"""
+    # 验证单个项的数据类型
+    validate_item_type(item, index)
+    
+    # 验证必选字段
+    validate_required_fields(item, index)
+    
+    # 创建处理后的对象，设置默认值
+    processed_item = create_processed_item(item)
+    
+    # 验证数值范围
+    validate_numeric_ranges(processed_item, index)
+    
+    logger.debug(f"Processed audio item {index+1}: {processed_item}")
+    return processed_item
+
+
+def validate_item_type(item: Any, index: int):
+    """验证单个项的数据类型"""
+    if not isinstance(item, dict):
+        logger.error(f"The {index}th item should be a dict")
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item should be a dict")
+
+
+def validate_required_fields(item: Dict[str, Any], index: int):
+    """验证必选字段"""
+    required_fields = ["audio_url", "start", "end"]
+    missing_fields = [field for field in required_fields if field not in item]
+    
+    if missing_fields:
+        logger.error(f"The {index}th item is missing required fields: {', '.join(missing_fields)}")
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item is missing required fields: {', '.join(missing_fields)}")
+
+
+def create_processed_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """创建处理后的音频项，设置默认值"""
+    return {
+        "audio_url": item["audio_url"],
+        "duration": item.get("duration"),  # duration变为可选字段
+        "start": item["start"],
+        "end": item["end"],
+        "volume": item.get("volume", 1.0),  # 默认音量 1.0
+        "audio_effect": item.get("audio_effect", None)  # 默认无音频效果
+    }
+
+
+def validate_numeric_ranges(processed_item: Dict[str, Any], index: int):
+    """验证数值范围"""
+    if processed_item["volume"] < 0.0 or processed_item["volume"] > 2.0:
+        logger.warning(f"Volume value {processed_item['volume']} out of range [0.0, 2.0], using default 1.0")
+        processed_item["volume"] = 1.0
+
+    if not isinstance(processed_item["start"], (int, float)) or processed_item["start"] < 0:
+        logger.error(f"the {index}th item has invalid start time: {processed_item['start']}")
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item has invalid start time")
+
+    if not isinstance(processed_item["end"], (int, float)) or processed_item["end"] <= processed_item["start"]:
+        logger.error(f"the {index}th item has invalid end time: {processed_item['end']}")
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item has invalid end time")
+
+    # 将时间转换为整数（微秒），兼容 start/end 为小数的情况
+    processed_item["start"] = int(processed_item["start"])
+    processed_item["end"] = int(processed_item["end"])
+    if processed_item["end"] <= processed_item["start"]:
+        logger.error(
+            f"the {index}th item has invalid end time after int conversion: "
+            f"start={processed_item['start']}, end={processed_item['end']}"
+        )
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item has invalid end time")
+    
+    # 如果提供了 duration 且小于等于 0，则报错
+    if processed_item["duration"] is not None and processed_item["duration"] <= 0:
+        logger.error(f"Invalid duration: {processed_item['duration']}")
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item has invalid duration")

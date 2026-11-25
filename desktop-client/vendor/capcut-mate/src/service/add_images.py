@@ -1,0 +1,622 @@
+# Copyright 2026 Hommy <taohongmin@sina.cn>.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from src.utils.logger import logger
+from src.pyJianYingDraft import ScriptFile, trange
+import src.pyJianYingDraft as draft
+from src.utils.draft_cache import DRAFT_CACHE
+from exceptions import CustomException, CustomError
+from src.schemas.add_images import SegmentInfo
+import os
+from src.utils import helper
+from src.utils.download import download
+import config
+import json
+import asyncio
+import time
+from typing import List, Dict, Any, Tuple, Optional
+from src.utils.draft_lock_manager import DraftLockManager
+
+from src.pyJianYingDraft.metadata import IntroType, OutroType, GroupAnimationType, TransitionType
+
+
+def add_images(
+    draft_url: str, 
+    image_infos: str,
+    alpha: float = 1.0, 
+    scale_x: float = 1.0, 
+    scale_y: float = 1.0, 
+    transform_x: int = 0, 
+    transform_y: int = 0
+) -> Tuple[str, str, List[str], List[str], List[SegmentInfo]]:
+    """
+    添加图片到剪映草稿的业务逻辑
+    
+    Args:
+        draft_url: 草稿URL，必选参数
+        image_infos: 图片信息JSON字符串，格式如下：
+        [
+            {
+                "image_url": "https://s.coze.cn/t/XpufYwc2_u4/", // [必选] 图片文件URL
+                "width": 1920, // [可选] 图片宽度(像素)，不传则使用草稿画布尺寸
+                "height": 1080, // [可选] 图片高度(像素)，不传则使用草稿画布尺寸
+                "start": 0, // [必选] 显示开始时间(微秒)
+                "end": 1000000, // [必选] 显示结束时间(微秒)
+                "in_animation": "", // [可选] 入场动画类型
+                "out_animation": "", // [可选] 出场动画类型
+                "loop_animation": "", // [可选] 循环动画类型
+                "in_animation_duration": "", // [可选] 入场动画时长(微秒)
+                "out_animation_duration": "", // [可选] 出场动画时长(微秒)
+                "loop_animation_duration": "", // [可选] 循环动画时长(微秒)
+                "transition": "", // [可选] 转场效果类型
+                "transition_duration": "" // [可选] 转场时长(微秒)，未指定则用转场类型默认时长
+            }
+        ]
+        alpha: 全局透明度[0, 1]，默认值为1.0
+        scale_x: X轴缩放比例，默认值为1.0
+        scale_y: Y轴缩放比例，默认值为1.0
+        transform_x: X轴位置偏移(像素)，默认值为0
+        transform_y: Y轴位置偏移(像素)，默认值为0
+    
+    Returns:
+        draft_url: 草稿URL
+        track_id: 图片轨道ID（非主轨道）
+        image_ids: 图片ID列表
+        segment_ids: 片段ID列表
+        segment_infos: 片段信息列表，包含每个片段的ID、开始时间和结束时间
+
+    Raises:
+        CustomException: 图片批量添加失败
+    """
+    return _add_images_internal(
+        draft_url=draft_url,
+        image_infos=image_infos,
+        alpha=alpha,
+        scale_x=scale_x,
+        scale_y=scale_y,
+        transform_x=transform_x,
+        transform_y=transform_y,
+        prepared_images=None,
+    )
+
+
+def _prepare_images_local_files(draft_url: str, image_infos: str) -> List[Dict[str, Any]]:
+    """
+    校验草稿、解析 image_infos 并下载素材到草稿目录。
+    不修改 ScriptFile，可在草稿写锁外调用。
+    """
+    draft_id = helper.get_url_param(draft_url, "draft_id")
+    if (not draft_id) or (draft_id not in DRAFT_CACHE):
+        logger.error(f"Invalid draft URL or draft not found in cache, draft_id: {draft_id}")
+        raise CustomException(CustomError.INVALID_DRAFT_URL)
+
+    draft_dir = os.path.join(config.DRAFT_DIR, draft_id)
+    draft_image_dir = os.path.join(draft_dir, "assets", "images")
+    os.makedirs(name=draft_image_dir, exist_ok=True)
+    logger.info(f"Created image directory: {draft_image_dir}")
+
+    images = parse_image_data(json_str=image_infos)
+    if len(images) == 0:
+        logger.error(f"No image info provided, draft_id: {draft_id}")
+        raise CustomException(CustomError.INVALID_IMAGE_INFO)
+
+    for image in images:
+        image["local_image_path"] = download(url=image["image_url"], save_dir=draft_image_dir)
+
+    return images
+
+
+def _add_images_internal(
+    draft_url: str,
+    image_infos: str,
+    alpha: float = 1.0,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+    transform_x: int = 0,
+    transform_y: int = 0,
+    prepared_images: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, str, List[str], List[str], List[SegmentInfo]]:
+    logger.info(
+        f"add_images started, draft_url: {draft_url}, alpha: {alpha}, scale_x: {scale_x}, "
+        f"scale_y: {scale_y}, transform_x: {transform_x}, transform_y: {transform_y}"
+    )
+
+    draft_id = helper.get_url_param(draft_url, "draft_id")
+    if (not draft_id) or (draft_id not in DRAFT_CACHE):
+        logger.error(f"Invalid draft URL or draft not found in cache, draft_id: {draft_id}")
+        raise CustomException(CustomError.INVALID_DRAFT_URL)
+
+    draft_dir = os.path.join(config.DRAFT_DIR, draft_id)
+    draft_image_dir = os.path.join(draft_dir, "assets", "images")
+    os.makedirs(name=draft_image_dir, exist_ok=True)
+    logger.info(f"Using image directory: {draft_image_dir}")
+
+    if prepared_images is not None:
+        images = prepared_images
+    else:
+        images = parse_image_data(json_str=image_infos)
+        if len(images) == 0:
+            logger.error(f"No image info provided, draft_id: {draft_id}")
+            raise CustomException(CustomError.INVALID_IMAGE_INFO)
+
+    logger.info(f"Using {len(images)} image items")
+
+    script: ScriptFile = DRAFT_CACHE[draft_id]
+
+    track_name = f"image_track_{helper.gen_unique_id()}"
+    # 与 add_videos / add_captions / add_filters 等一致：按全局接口调用顺序叠层（后调用在上）
+    script.add_track_ordered(track_type=draft.TrackType.video, track_name=track_name)
+    logger.info(f"Added image track (non-main track): {track_name}")
+
+    segment_ids = []
+    segment_infos = []
+    for i, image in enumerate(images):
+        try:
+            segment_id, segment_info = add_image_to_draft(
+                script, track_name,
+                draft_image_dir=draft_image_dir,
+                image=image,
+                alpha=alpha,
+                scale_x=scale_x,
+                scale_y=scale_y,
+                transform_x=transform_x,
+                transform_y=transform_y,
+            )
+            segment_ids.append(segment_id)
+            segment_infos.append(segment_info)
+            logger.info(f"Added image {i+1}/{len(images)}, segment_id: {segment_id}")
+        except Exception as e:
+            logger.error(f"Failed to add image {i+1}/{len(images)}, error: {str(e)}")
+            raise
+
+    script.save()
+    logger.info(f"Draft saved successfully")
+
+    track_id = ""
+    for key in script.tracks.keys():
+        if script.tracks[key].name == track_name:
+            track_id = script.tracks[key].track_id
+            break
+    logger.info(f"Image track created, draft_id: {draft_id}, track_id: {track_id}")
+
+    image_ids = [video.material_id for video in script.materials.videos if video.material_type == "photo"]
+    logger.info(f"Image track completed, draft_id: {draft_id}, image_ids: {image_ids}")
+
+    return draft_url, track_id, image_ids, segment_ids, segment_infos
+
+
+async def add_images_async(
+    draft_url: str,
+    image_infos: str,
+    alpha: float = 1.0,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+    transform_x: int = 0,
+    transform_y: int = 0,
+    lock_timeout: float = 30.0
+) -> Tuple[str, str, List[str], List[str], List[SegmentInfo]]:
+    """
+    添加图片到剪映草稿的异步版本（带并发锁保护）
+    
+    功能：
+    1. 使用 DraftLockManager 防止同一草稿的并发写操作
+    2. 支持超时控制，避免无限等待
+    3. 自动释放锁，即使发生异常
+    4. 图片下载在获取锁之前完成，持锁阶段仅修改草稿与写盘
+    
+    Args:
+        draft_url: 草稿 URL，格式：".../get_draft?draft_id=xxx"
+        image_infos: JSON 字符串，包含图片信息列表，详见 add_images 函数
+        alpha: 全局透明度 [0, 1]，默认 1.0
+        scale_x: X 轴缩放比例，默认 1.0
+        scale_y: Y 轴缩放比例，默认 1.0
+        transform_x: X 轴位置偏移（像素），默认 0
+        transform_y: Y 轴位置偏移（像素），默认 0
+        lock_timeout: 获取锁的超时时间（秒），默认 30 秒
+    
+    Returns:
+        tuple: (draft_url, track_id, image_ids, segment_ids, segment_infos)
+    
+    Raises:
+        CustomException: 图片添加失败，或 `DRAFT_LOCK_TIMEOUT`（获取写锁超时）
+    
+    Example:
+        >>> result = await add_images_async(
+        ...     draft_url="http://.../draft_id=123",
+        ...     image_infos='[{"image_url":"...", "width":1024, "height":1024, "start":0, "end":5000000}]'
+        ... )
+    """
+    draft_id = helper.get_url_param(draft_url, "draft_id")
+    if not draft_id:
+        raise CustomException(CustomError.INVALID_DRAFT_URL)
+
+    logger.info(f"[flow:add_images] prep_start, draft_id: {draft_id}")
+    # 下载与预处理放到线程池，避免阻塞事件循环导致锁超时漂移
+    prep_started_at = time.monotonic()
+    prepared_images = await asyncio.to_thread(
+        _prepare_images_local_files,
+        draft_url,
+        image_infos,
+    )
+    logger.info(
+        f"[flow:add_images] prep_done, draft_id: {draft_id}, "
+        f"count: {len(prepared_images)}, elapsed: {time.monotonic() - prep_started_at:.3f}s"
+    )
+
+    lock_manager = DraftLockManager()
+
+    logger.info(f"[flow:add_images] lock_wait_start, draft_id: {draft_id}, timeout: {lock_timeout}s")
+    try:
+        await lock_manager.acquire_lock(draft_id, timeout=lock_timeout)
+        logger.info(f"[flow:add_images] lock_acquired, draft_id: {draft_id}")
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout waiting for lock on draft_id: {draft_id}")
+        raise CustomException(
+            CustomError.DRAFT_LOCK_TIMEOUT,
+            f"Failed to acquire lock for draft {draft_id} within {lock_timeout}s",
+        )
+
+    try:
+        return _add_images_internal(
+            draft_url=draft_url,
+            image_infos=image_infos,
+            alpha=alpha,
+            scale_x=scale_x,
+            scale_y=scale_y,
+            transform_x=transform_x,
+            transform_y=transform_y,
+            prepared_images=prepared_images,
+        )
+    finally:
+        await lock_manager.release_lock(draft_id)
+        logger.info(f"[flow:add_images] lock_released, draft_id: {draft_id}")
+
+
+def add_image_to_draft(
+    script: ScriptFile,
+    track_name: str,
+    draft_image_dir: str,
+    image: dict,
+    alpha: float = 1.0, 
+    scale_x: float = 1.0, 
+    scale_y: float = 1.0, 
+    transform_x: int = 0, 
+    transform_y: int = 0
+) -> Tuple[str, SegmentInfo]:
+    """
+    向剪映草稿中添加单个图片
+    
+    Args:
+        script: 草稿文件对象
+        track_name: 视频轨道名称
+        draft_image_dir: 图片资源目录
+        image: 图片信息字典，包含以下字段：
+            image_url: 图片URL
+            width: 图片宽度(像素，可选，不传则使用草稿画布尺寸)
+            height: 图片高度(像素，可选，不传则使用草稿画布尺寸)
+            start: 显示开始时间(微秒)
+            end: 显示结束时间(微秒)
+            in_animation: 入场动画类型(可选)
+            out_animation: 出场动画类型(可选)
+            loop_animation: 循环动画类型(可选)
+            in_animation_duration: 入场动画时长(微秒，可选)
+            out_animation_duration: 出场动画时长(微秒，可选)
+            loop_animation_duration: 循环动画时长(微秒，可选)
+            transition: 转场效果类型(可选)
+            transition_duration: 转场效果时长(微秒，可选)
+        alpha: 图片透明度
+        scale_x: 横向缩放
+        scale_y: 纵向缩放
+        transform_x: X轴位置偏移(像素)
+        transform_y: Y轴位置偏移(像素)
+    
+    Returns:
+        segment_id: 片段ID
+        segment_info: 片段信息字典，包含id、start、end
+    
+    Raises:
+        CustomException: 添加图片失败
+    """
+    try:
+        image_path = image.get("local_image_path")
+        if image_path:
+            if not os.path.isfile(image_path):
+                raise CustomException(CustomError.IMAGE_ADD_FAILED, f"Missing local file: {image_path}")
+            logger.info(f"Using local image: {image_path}")
+        else:
+            image_path = download(url=image["image_url"], save_dir=draft_image_dir)
+            logger.info(f"Downloaded image from {image['image_url']} to {image_path}")
+
+        # 2. 创建图片素材并添加到草稿
+        segment_duration = image['end'] - image['start']
+                
+        # 获取草稿的宽高用于transform坐标转换
+        draft_width = script.width
+        draft_height = script.height
+        image_width = int(image.get("width") or draft_width)
+        image_height = int(image.get("height") or draft_height)
+        logger.info(
+            f"draft size: {draft_width}x{draft_height}, image size: {image_width}x{image_height}, "
+            f"transform_x: {transform_x}, transform_y: {transform_y}"
+        )
+                
+        # 创建图像调节设置
+        clip_settings = draft.ClipSettings(
+            alpha=alpha,
+            scale_x=scale_x,
+            scale_y=scale_y,
+            transform_x=transform_x / draft_width,  # 转为半画布宽单位
+            transform_y=transform_y / draft_height  # 转换为半画布高单位
+        )
+        
+        # 创建视频片段（图片使用VideoSegment）
+        video_segment = draft.VideoSegment(
+            material=image_path,
+            target_timerange=trange(start=image['start'], duration=segment_duration),
+            clip_settings=clip_settings
+        )
+        
+        # 3. 添加动画效果（如果指定了）
+        if image.get('in_animation'):
+            try:
+                in_duration = image.get('in_animation_duration')
+                if in_duration is not None and in_duration != "":
+                    in_duration = int(in_duration)
+                else:
+                    in_duration = None
+                
+                intro_enum = map_video_animation_name_to_enum(image['in_animation'], 'in')
+                if intro_enum:
+                    video_segment.add_animation(intro_enum, duration=in_duration)
+                    logger.info(f"Successfully added in animation '{image['in_animation']}' to image segment")
+                else:
+                    logger.warning(f"In animation '{image['in_animation']}' not found in available animations")
+            except Exception as e:
+                logger.warning(f"Failed to add in animation '{image['in_animation']}': {str(e)}")
+        
+        if image.get('out_animation'):
+            try:
+                out_duration = image.get('out_animation_duration')
+                if out_duration is not None and out_duration != "":
+                    out_duration = int(out_duration)
+                else:
+                    out_duration = None
+                
+                outro_enum = map_video_animation_name_to_enum(image['out_animation'], 'out')
+                if outro_enum:
+                    video_segment.add_animation(outro_enum, duration=out_duration)
+                    logger.info(f"Successfully added out animation '{image['out_animation']}' to image segment")
+                else:
+                    logger.warning(f"Out animation '{image['out_animation']}' not found in available animations")
+            except Exception as e:
+                logger.warning(f"Failed to add out animation '{image['out_animation']}': {str(e)}")
+        
+        # 注意：对于图片，循环动画通常不适用，所以这里处理为组合动画
+        if image.get('loop_animation'):
+            try:
+                group_duration = image.get('loop_animation_duration')
+                if group_duration is not None and group_duration != "":
+                    group_duration = int(group_duration)
+                else:
+                    group_duration = None
+                
+                group_enum = map_video_animation_name_to_enum(image['loop_animation'], 'group')
+                if group_enum:
+                    video_segment.add_animation(group_enum, duration=group_duration)
+                    logger.info(f"Successfully added group animation '{image['loop_animation']}' to image segment")
+                else:
+                    logger.warning(f"Group animation '{image['loop_animation']}' not found in available animations")
+            except Exception as e:
+                logger.warning(f"Failed to add group animation '{image['loop_animation']}': {str(e)}")
+        
+        # 4. 添加转场效果（如果指定了）
+        if image.get('transition'):
+            try:
+                # 遍历TransitionType中的所有转场效果
+                transition_enum = None
+                for attr_name in dir(TransitionType):
+                    attr = getattr(TransitionType, attr_name)
+                    if isinstance(attr, TransitionType) and attr.value.name == image['transition']:
+                        transition_enum = attr
+                        break
+                
+                if transition_enum:
+                    transition_duration = image.get('transition_duration')
+                    if transition_duration is not None and transition_duration != "":
+                        transition_duration = int(transition_duration)
+                    else:
+                        transition_duration = None
+                    video_segment.add_transition(transition_enum, duration=transition_duration)
+                    logger.info(f"Successfully added transition '{image['transition']}' to image segment")
+                else:
+                    logger.warning(f"Transition '{image['transition']}' not found in available transitions")
+            except Exception as e:
+                logger.warning(f"Failed to add transition '{image['transition']}': {str(e)}")
+
+        logger.info(f"Created image segment, material_id: {video_segment.material_instance.material_id}")
+        logger.info(f"Image segment details - start: {image['start']}, duration: {segment_duration}, size: {image_width}x{image_height}")
+
+        # 5. 向指定轨道添加片段
+        script.add_segment(video_segment, track_name)
+
+        # 6. 构造片段信息
+        segment_info = SegmentInfo(
+            id=video_segment.segment_id,
+            start=image['start'],
+            end=image['end']
+        )
+
+        return video_segment.segment_id, segment_info
+        
+    except CustomException:
+        logger.error(f"Add image to draft failed, draft_image_dir: {draft_image_dir}, image: {image}")
+        raise
+    except Exception as e:
+        logger.error(f"Add image to draft failed, error: {str(e)}")
+        raise CustomException(err=CustomError.IMAGE_ADD_FAILED)
+
+
+def map_video_animation_name_to_enum(animation_name: str, animation_type: str):
+    """
+    将视频动画名称字符串映射到对应的枚举值
+    
+    Args:
+        animation_name: 动画名称字符串
+        animation_type: 动画类型 ("in", "out", "group")
+    
+    Returns:
+        对应的动画枚举值，如果未找到则返回None
+    """
+    # 入场动画映射
+    in_animation_map = {}
+    for attr_name in dir(IntroType):
+        attr = getattr(IntroType, attr_name)
+        if isinstance(attr, IntroType):
+            in_animation_map[attr.value.title] = attr
+    
+    # 出场动画映射
+    out_animation_map = {}
+    for attr_name in dir(OutroType):
+        attr = getattr(OutroType, attr_name)
+        if isinstance(attr, OutroType):
+            out_animation_map[attr.value.title] = attr
+    
+    # 组合动画映射
+    group_animation_map = {}
+    for attr_name in dir(GroupAnimationType):
+        attr = getattr(GroupAnimationType, attr_name)
+        if isinstance(attr, GroupAnimationType):
+            group_animation_map[attr.value.title] = attr
+    
+    if animation_type == "in":
+        return in_animation_map.get(animation_name)
+    elif animation_type == "out":
+        return out_animation_map.get(animation_name)
+    elif animation_type == "group":
+        return group_animation_map.get(animation_name)
+    
+    return None
+
+
+def parse_image_data(json_str: str) -> List[Dict[str, Any]]:
+    """
+    解析图片数据的JSON字符串，处理可选字段的默认值
+    
+    Args:
+        json_str: 包含图片数据的JSON字符串，格式如下：
+        [
+            {
+                "image_url": "https://s.coze.cn/t/XpufYwc2_u4/", // [必选] 图片文件URL
+                "width": 1920, // [可选] 图片宽度(像素)，不传则使用草稿画布尺寸
+                "height": 1080, // [可选] 图片高度(像素)，不传则使用草稿画布尺寸
+                "start": 0, // [必选] 显示开始时间(微秒)
+                "end": 1000000, // [必选] 显示结束时间(微秒)
+                "in_animation": "", // [可选] 入场动画类型
+                "out_animation": "", // [可选] 出场动画类型
+                "loop_animation": "", // [可选] 循环动画类型
+                "in_animation_duration": "", // [可选] 入场动画时长(微秒)
+                "out_animation_duration": "", // [可选] 出场动画时长(微秒)
+                "loop_animation_duration": "", // [可选] 循环动画时长(微秒)
+                "transition": "", // [可选] 转场效果类型
+                "transition_duration": "" // [可选] 转场时长(微秒)，未指定则用转场类型默认时长
+            }
+        ]
+        
+    Returns:
+        包含图片对象的数组，每个对象都处理了默认值
+        
+    Raises:
+        CustomException: 当JSON格式错误或缺少必选字段时抛出
+    """
+    try:
+        # 解析JSON字符串
+        data = json.loads(json_str)
+        logger.info(f"Successfully parsed JSON with {len(data) if isinstance(data, list) else 1} items")
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error: {e.msg}")
+        raise CustomException(CustomError.INVALID_IMAGE_INFO, f"JSON parse error: {e.msg}")
+    
+    # 确保输入是列表
+    if not isinstance(data, list):
+        logger.error("Image infos should be a list")
+        raise CustomException(CustomError.INVALID_IMAGE_INFO, "image_infos should be a list")
+    
+    result = []
+    
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            logger.error(f"The {i}th item should be a dict")
+            raise CustomException(CustomError.INVALID_IMAGE_INFO, f"the {i}th item should be a dict")
+        
+        # 检查必选字段（width/height 可选，未传时在 add_image_to_draft 中使用草稿画布尺寸）
+        required_fields = ["image_url", "start", "end"]
+        missing_fields = [field for field in required_fields if field not in item]
+        
+        if missing_fields:
+            logger.error(f"The {i}th item is missing required fields: {', '.join(missing_fields)}")
+            raise CustomException(CustomError.INVALID_IMAGE_INFO, f"the {i}th item is missing required fields: {', '.join(missing_fields)}")
+        
+        width = item.get("width")
+        height = item.get("height")
+        if width is not None:
+            width = int(width)
+        if height is not None:
+            height = int(height)
+        # 创建处理后的对象，设置默认值
+        processed_item = {
+            "image_url": item["image_url"],
+            "width": width,
+            "height": height,
+            "start": item["start"],
+            "end": item["end"],
+            "in_animation": item.get("in_animation", None),  # 默认无入场动画
+            "out_animation": item.get("out_animation", None),  # 默认无出场动画
+            "loop_animation": item.get("loop_animation", None),  # 默认无循环动画
+            "in_animation_duration": item.get("in_animation_duration", None),  # 默认无入场动画时长
+            "out_animation_duration": item.get("out_animation_duration", None),  # 默认无出场动画时长
+            "loop_animation_duration": item.get("loop_animation_duration", None),  # 默认无循环动画时长
+            "transition": item.get("transition", None),  # 默认无转场
+            "transition_duration": item.get("transition_duration", None),  # 默认用转场类型自身时长
+        }
+        
+        # 验证数值范围（仅校验显式传入的尺寸）
+        if (processed_item["width"] is not None and processed_item["width"] <= 0) or (
+            processed_item["height"] is not None and processed_item["height"] <= 0
+        ):
+            logger.error(
+                f"Invalid image dimensions: width={processed_item['width']}, height={processed_item['height']}"
+            )
+            raise CustomException(CustomError.INVALID_IMAGE_INFO, f"the {i}th item has invalid image dimensions")
+
+        if not isinstance(processed_item["start"], (int, float)) or processed_item["start"] < 0:
+            logger.error(f"the {i}th item has invalid start time: {processed_item['start']}")
+            raise CustomException(CustomError.INVALID_IMAGE_INFO, f"the {i}th item has invalid start time")
+
+        if not isinstance(processed_item["end"], (int, float)) or processed_item["end"] <= processed_item["start"]:
+            logger.error(f"the {i}th item has invalid end time: {processed_item['end']}")
+            raise CustomException(CustomError.INVALID_IMAGE_INFO, f"the {i}th item has invalid end time")
+
+        # 将时间转换为整数（微秒），兼容 start/end 为小数的情况
+        processed_item["start"] = int(processed_item["start"])
+        processed_item["end"] = int(processed_item["end"])
+        if processed_item["end"] <= processed_item["start"]:
+            logger.error(
+                f"the {i}th item has invalid end time after int conversion: "
+                f"start={processed_item['start']}, end={processed_item['end']}"
+            )
+            raise CustomException(CustomError.INVALID_IMAGE_INFO, f"the {i}th item has invalid end time")
+        
+        result.append(processed_item)
+        logger.debug(f"Processed image item {i+1}: {processed_item}")
+    
+    return result

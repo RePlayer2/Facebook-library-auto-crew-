@@ -1,0 +1,57 @@
+# -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_all
+
+datas = [('/Users/zzh/C/similar_craw/Meta广告素材客户端包/crawler/meta_material_pipeline.py', 'crawler'), ('/Users/zzh/C/similar_craw/Meta广告素材客户端包/crawler/meta_ad_card_extractor.py', 'crawler'), ('/Users/zzh/C/similar_craw/Meta广告素材客户端包/crawler/meta_ad_card_batch_by_ids.py', 'crawler'), ('/Users/zzh/C/similar_craw/Meta广告素材客户端包/crawler/meta_ad_page_until_id.py', 'crawler'), ('/Users/zzh/C/similar_craw/Meta广告素材客户端包/crawler/meta_ad_page_until_id_使用指南.md', 'crawler'), ('/Users/zzh/C/similar_craw/Meta广告素材客户端包/crawler/create_and_copy_dated_folders.py', 'crawler'), ('/Users/zzh/C/similar_craw/Meta广告素材客户端包/crawler/capcut_local_draft_import.py', 'crawler'), ('/Users/zzh/C/similar_craw/Meta广告素材客户端包/summary_scripts/generate_summary.py', 'summary_scripts'), ('/Users/zzh/C/similar_craw/Meta广告素材客户端包/summary_scripts/generate_image_summary.py', 'summary_scripts')]
+binaries = []
+hiddenimports = ['html', 'html.parser', 'json', 'urllib.request', 'urllib.parse', 'urllib.error', 'argparse', 'pathlib', 're', 'shutil', 'socket', 'http.server', 'socketserver', 'contextlib', 'fnmatch', 'threading', 'time', 'base64', 'dataclasses', 'typing']
+tmp_ret = collect_all('playwright')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+
+a = Analysis(
+    ['/Users/zzh/C/similar_craw/Meta广告素材客户端包/crawler/meta_material_client.py'],
+    pathex=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='Meta广告素材客户端',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='Meta广告素材客户端',
+)
+app = BUNDLE(
+    coll,
+    name='Meta广告素材客户端.app',
+    icon=None,
+    bundle_identifier=None,
+)

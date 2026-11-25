@@ -1,0 +1,2 @@
+083b4518f2e21b720ae9d964731bb1e900d8b3433e551a5062e5abf4238dd0a3  Meta广告素材客户端-AppleSilicon-并发抓取版.zip
+0ace8f8f2532f8b85aba48dda718cda4035fd1614591c93df964d601e39565dc  Meta广告素材客户端-Intel-并发抓取版.zip
